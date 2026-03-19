@@ -2,8 +2,17 @@
 name = "graph-clonable-ref"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.70"
+authors = ["prizzledev"]
+license = "MIT"
+description = "A fast, thread-safe cloneable reference that preserves reference structure during deep cloning"
+repository = "https://github.com/prizzledev/graph-clonable-ref"
+documentation = "https://docs.rs/graph-clonable-ref"
+keywords = ["clone", "deep-clone", "reference", "graph", "thread-safe"]
+categories = ["data-structures", "concurrency", "memory-management"]
 
 [dependencies]
+parking_lot = "0.12"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
