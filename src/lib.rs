@@ -32,7 +32,6 @@ use std::sync::{Arc, Weak};
 
 use parking_lot::RwLock;
 
-static NEXT_GRAPH_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
@@ -43,22 +42,14 @@ thread_local! {
 /// Internal storage for a group of related references.
 /// All `GraphRef`s created from the same `RefGraph` share the underlying data.
 pub struct RefGraph<T: Send + Sync> {
-    #[allow(dead_code)]
-    id: u64,
-    data: RwLock<Vec<RwLock<T>>>,
+    data: RwLock<Vec<T>>,
     clone_cache: RwLock<Vec<(u64, Weak<RefGraph<T>>)>>,
 }
-
-// Safety: RefGraph uses parking_lot::RwLock (Send+Sync) and Arc/Weak (Send+Sync).
-// T: Send + Sync is required by the type parameter bound.
-unsafe impl<T: Send + Sync> Send for RefGraph<T> {}
-unsafe impl<T: Send + Sync> Sync for RefGraph<T> {}
 
 impl<T: Send + Sync> RefGraph<T> {
     /// Create a new empty RefGraph.
     pub fn new() -> Arc<Self> {
         Arc::new(RefGraph {
-            id: NEXT_GRAPH_ID.fetch_add(1, Ordering::Relaxed),
             data: RwLock::new(Vec::new()),
             clone_cache: RwLock::new(Vec::new()),
         })
@@ -68,7 +59,7 @@ impl<T: Send + Sync> RefGraph<T> {
     pub fn create(self: &Arc<Self>, value: T) -> GraphRef<T> {
         let mut data = self.data.write();
         let index = data.len();
-        data.push(RwLock::new(value));
+        data.push(value);
         GraphRef {
             graph: Arc::clone(self),
             index,
@@ -95,14 +86,8 @@ impl<T: Clone + Send + Sync> RefGraph<T> {
     /// Deep clone this graph, creating independent copies of all data.
     fn deep_clone_graph(&self) -> Arc<RefGraph<T>> {
         let data = self.data.read();
-        let cloned_data: Vec<RwLock<T>> = data
-            .iter()
-            .map(|cell| RwLock::new(cell.read().clone()))
-            .collect();
-
         Arc::new(RefGraph {
-            id: NEXT_GRAPH_ID.fetch_add(1, Ordering::Relaxed),
-            data: RwLock::new(cloned_data),
+            data: RwLock::new(data.clone()),
             clone_cache: RwLock::new(Vec::new()),
         })
     }
@@ -114,8 +99,8 @@ impl<T: Clone + Send + Sync> RefGraph<T> {
         // Fast path: read lock (concurrent, uncontended ~2ns)
         {
             let cache = self.clone_cache.read();
-            for (gen, weak) in cache.iter() {
-                if *gen == current_gen {
+            for (generation, weak) in cache.iter() {
+                if *generation == current_gen {
                     if let Some(arc) = weak.upgrade() {
                         return arc;
                     }
@@ -129,8 +114,8 @@ impl<T: Clone + Send + Sync> RefGraph<T> {
         {
             let mut cache = self.clone_cache.write();
             // Double-check: another thread may have inserted while we were cloning
-            for (gen, weak) in cache.iter() {
-                if *gen == current_gen {
+            for (generation, weak) in cache.iter() {
+                if *generation == current_gen {
                     if let Some(arc) = weak.upgrade() {
                         // Another thread beat us; drop our clone, use theirs
                         return arc;
@@ -161,15 +146,12 @@ impl<T: Send + Sync> GraphRef<T> {
     where
         T: Clone,
     {
-        let data = self.graph.data.read();
-        let val = data[self.index].read().clone();
-        val
+        self.graph.data.read()[self.index].clone()
     }
 
     /// Set the referenced value.
     pub fn set(&self, value: T) {
-        let data = self.graph.data.read();
-        *data[self.index].write() = value;
+        self.graph.data.write()[self.index] = value;
     }
 
     /// Apply a function to the referenced value.
@@ -177,8 +159,7 @@ impl<T: Send + Sync> GraphRef<T> {
     where
         F: FnOnce(&mut T),
     {
-        let data = self.graph.data.read();
-        f(&mut *data[self.index].write());
+        f(&mut self.graph.data.write()[self.index]);
     }
 
     /// Get the index of this reference within its graph.
@@ -284,14 +265,14 @@ pub fn begin_deep_clone() -> DeepCloneGuard {
         c
     });
     if depth == 0 {
-        let gen = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
+        let generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
         // Skip 0 (0 means shallow clone)
-        let gen = if gen == 0 {
+        let generation = if generation == 0 {
             NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
         } else {
-            gen
+            generation
         };
-        CLONE_GENERATION.with(|g| g.set(gen));
+        CLONE_GENERATION.with(|g| g.set(generation));
     }
     DeepCloneGuard { _private: () }
 }

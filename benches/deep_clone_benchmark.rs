@@ -214,7 +214,7 @@ fn bench_clone_phase_only(c: &mut Criterion) {
 fn bench_per_ref_overhead(c: &mut Criterion) {
     let mut group = c.benchmark_group("per_ref_overhead");
 
-    for &size in &[100, 500, 1000, 2500, 5000] {
+    for &size in &[100, 500, 1000, 2500, 5000, 50000] {
         group.throughput(Throughput::Elements(size as u64));
 
         // Generation-based
@@ -366,6 +366,36 @@ fn bench_repeated_clones(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark get() and set() throughput at various sizes.
+fn bench_get_set(c: &mut Criterion) {
+    let mut group = c.benchmark_group("get_set");
+
+    for &size in &[100, 500, 1000, 5000, 50000] {
+        let graph = RefGraph::new();
+        let refs: Vec<_> = (0..size).map(|i| graph.create(i as i32)).collect();
+
+        group.throughput(Throughput::Elements(size as u64));
+
+        group.bench_with_input(BenchmarkId::new("get", size), &refs, |b, data| {
+            b.iter(|| {
+                for r in data.iter() {
+                    black_box(r.get());
+                }
+            });
+        });
+
+        group.bench_with_input(BenchmarkId::new("set", size), &refs, |b, data| {
+            b.iter(|| {
+                for (i, r) in data.iter().enumerate() {
+                    r.set(black_box(i as i32));
+                }
+            });
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_full_network_comparison,
@@ -374,6 +404,7 @@ criterion_group!(
     bench_prepare_overhead,
     bench_pos_array_clone_overhead,
     bench_repeated_clones,
+    bench_get_set,
 );
 
 criterion_main!(benches);

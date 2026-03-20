@@ -1,8 +1,8 @@
 [package]
 name = "graph-clonable-ref"
-version = "0.1.0"
-edition = "2021"
-rust-version = "1.70"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
 authors = ["prizzledev"]
 license = "MIT"
 description = "A fast, thread-safe cloneable reference that preserves reference structure during deep cloning"
