@@ -15,24 +15,30 @@ Traditional solutions use a `HashMap<*const T, Arc<T>>` during cloning to track 
 
 ## The Solution
 
-This crate uses **generation-based tracking** instead of HashMap lookups:
+This crate gives each deep clone a **thread-local clone map** keyed by graph, not by reference:
 
-- Each `RefGraph` caches its clone with a globally unique generation number
-- During `deep_clone()`, a unique generation is assigned via atomic counter
-- References check if their graph's cached clone matches the current generation
-- First reference triggers the clone, subsequent references get O(1) cache hits
-- Cache entries use `Weak` refs and auto-expire when no longer referenced
+- During `deep_clone()`, the thread records the clone of every graph it meets, keyed by the original graph's address
+- A reference into the same graph as the reference before it takes the clone from a last-used slot, without a hash lookup; a reference into another graph takes one hash lookup
+- Only the first reference into a graph touches the original graph: it reads the data once and clones it
+- No reference writes to memory that other threads share (no lock, no atomic on the original graph), so threads that deep-clone one shared template scale with the number of cores
+- The map is emptied when the outermost `deep_clone()` ends, also when a clone panics
 
-**Result: ~7 nanoseconds per reference** — thread-safe, panic-safe, and 2.5x faster than HashMap.
+Up to 0.2, each graph cached its clones behind a lock that every cloned reference took. Threads that deep-cloned one shared template slowed each other down: with one graph of 2048 values, 16 threads together managed 7% of the deep clones per second of one thread (`benches/parallel_scaling.rs`).
 
 ## Features
 
 - **Thread-safe** — `Send + Sync`, works with `Arc`, actix-web, tokio, rayon, etc.
-- **Panic-safe** — `DeepCloneGuard` with depth tracking resets state correctly on unwind
-- **Fast** — generation-based O(1) cache hits, ~7ns per reference
+- **Scales across threads** — a cloned reference touches only thread-local memory and its new graph
+- **Panic-safe** — `DeepCloneGuard` with depth tracking ends the pass and empties the clone map on unwind
+- **Fast** — no hash lookup for consecutive references into one graph, one lookup otherwise
 - **Nestable** — `deep_clone` inside `deep_clone` works correctly
 - **Zero boilerplate** — works with `#[derive(Clone)]`, no special traits needed
-- **No `'static` bound** — works with any lifetime
+- **`T: 'static`** — `GraphRef<T>` is `Clone` only for `T: 'static`, since the clone map stores graphs type-erased (`dyn Any`)
+
+### Upgrading from 0.2
+
+- `GraphRef<T>: Clone` now requires `T: 'static`, for shallow clones too (both go through `Clone`); a `GraphRef<&'a str>` with a borrowed, non-`'static` lifetime can no longer be cloned
+- `RefGraph::clear_cache()` does nothing; it is kept so existing calls still compile
 
 ## Installation
 
@@ -40,7 +46,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-graph-clonable-ref = "0.2"
+graph-clonable-ref = "0.3"
 ```
 
 ## Usage
@@ -175,7 +181,7 @@ Container for a group of related references.
 let graph = RefGraph::new();              // -> Arc<RefGraph<T>>
 let r: GraphRef<i32> = graph.create(42);  // create a reference
 let count = graph.len();                  // number of values
-graph.clear_cache();                      // free clone cache memory
+graph.clear_cache();                      // no-op since 0.3 (kept for compatibility)
 ```
 
 ### `GraphRef<T: Send + Sync>`
@@ -202,17 +208,17 @@ For manual control over the cloning scope (advanced). Supports nesting.
 ```rust
 let _guard = begin_deep_clone();
 let a2 = a.clone();  // deep clone
-let b2 = b.clone();  // deep clone, same generation
+let b2 = b.clone();  // deep clone, same pass
 // guard dropped -> back to shallow clone behavior
 ```
 
 ## Performance
 
-Benchmarks on a network with 5 layers x 500 references (3750 total with sharing):
+Benchmarks on a network with 5 layers x 500 references (3750 total with sharing), measured with 0.2 (generation-based per-graph cache) and not yet repeated for the thread-local map of 0.3:
 
 | Approach | Time | Per Reference |
 |----------|------|---------------|
-| **Generation-based (this crate)** | ~26 µs | ~7 ns |
+| **Generation-based (0.2)** | ~26 µs | ~7 ns |
 | HashMap-based | ~64 µs | ~17 ns |
 | Two-phase index (clone only) | ~105 µs | ~28 ns |
 | Two-phase index (with prepare) | ~191 µs | ~51 ns |
@@ -220,7 +226,8 @@ Benchmarks on a network with 5 layers x 500 references (3750 total with sharing)
 Run benchmarks yourself:
 
 ```bash
-cargo bench
+cargo bench                              # single thread, compared with other approaches
+cargo bench --bench parallel_scaling     # deep clones per second for 1 to 16 threads
 ```
 
 ## How It Works
@@ -228,14 +235,14 @@ cargo bench
 1. **Normal clone (`a.clone()`)**: Returns a new `GraphRef` pointing to the same data (shallow, like `Arc::clone`)
 
 2. **Deep clone (`deep_clone(&x)`)**:
-   - Assigns a globally unique generation via `AtomicU64`
-   - Calls `x.clone()` which triggers special behavior
-   - Each `GraphRef::clone()` checks: does my graph have a cached clone for this generation?
-     - **Yes** (read lock): Return a ref to the cached clone — O(1)
-     - **No** (write lock): Clone the graph, cache with `Weak` ref, return new ref
-   - `DeepCloneGuard` resets state on drop (even on panic)
+   - Raises a thread-local depth counter and calls `x.clone()`
+   - Each `GraphRef::clone()` sees the depth and asks the thread-local clone map for the clone of its graph:
+     - **Same graph as the reference before**: taken from the last-used slot, no hash lookup
+     - **Graph met before in this pass**: one hash lookup by the original graph's address
+     - **First reference into the graph**: read the data once, clone it into a new graph, and record it together with a strong reference to the original, so no other graph can get that address during the pass
+   - `DeepCloneGuard` ends the pass when the outermost guard drops (even on panic): the map is emptied, releasing originals and clones
 
-Cache entries use `Weak<RefGraph<T>>` so they auto-expire when the cloned graph is dropped. Dead entries are cleaned up lazily on cache-miss writes.
+A `deep_clone` inside another one joins the outer pass. Graphs cache nothing, and the map holds nothing between passes; it keeps its capacity on each thread for the next pass.
 
 ## License
 
