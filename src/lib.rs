@@ -1023,9 +1023,7 @@ mod tests {
 
         // Add some shared refs
         let mut all_refs = refs.clone();
-        for i in 0..5_000 {
-            all_refs.push(refs[i].clone());
-        }
+        all_refs.extend(refs[..5_000].iter().cloned());
 
         let cloned = deep_clone(&all_refs);
 
@@ -1037,8 +1035,8 @@ mod tests {
         }
 
         // Check values
-        for i in 0..10_000 {
-            assert_eq!(cloned[i].get(), i as i32);
+        for (i, r) in cloned[..10_000].iter().enumerate() {
+            assert_eq!(r.get(), i as i32);
         }
 
         // Independence
