@@ -503,8 +503,8 @@ pub mod index_based {
     pub struct PerformIndexCloningNode<T> {
         /// Current position in pos_array
         counter: usize,
-        /// Pre-allocated array of new references
-        ref_array: Vec<Rc<RefCell<T>>>,
+        /// New references by position; `None` until the first reference to it is cloned.
+        ref_array: Vec<Option<Rc<RefCell<T>>>>,
         /// Cloned from PrepareNode
         pos_array: Vec<(bool, usize)>,
     }
@@ -512,14 +512,9 @@ pub mod index_based {
     impl<T: Clone> PerformIndexCloningNode<T> {
         /// Create from a prepare node. This clones the pos_array.
         pub fn from_prepare_node(node: &PrepareIndexCloningNode<T>) -> Self {
-            // Pre-allocate with dummy values (will be replaced)
-            let mut ref_array = Vec::with_capacity(node.ref_pos_counter);
-            ref_array.resize_with(node.ref_pos_counter, || {
-                Rc::new(RefCell::new(unsafe {
-                    // This is safe because we'll always set before reading
-                    std::mem::zeroed()
-                }))
-            });
+            // `None` instead of placeholder values: zeroed memory is not a valid `T` in general
+            // (`String`, references, `NonZero*`), and creating one is undefined behaviour.
+            let ref_array = vec![None; node.ref_pos_counter];
 
             Self {
                 counter: 0,
@@ -539,12 +534,15 @@ pub mod index_based {
             if !exists {
                 // First time seeing this reference in this clone
                 let new_ref = Rc::new(RefCell::new(orig.inner.borrow().clone()));
-                self.ref_array[array_pos] = Rc::clone(&new_ref);
+                self.ref_array[array_pos] = Some(Rc::clone(&new_ref));
                 IndexRef { inner: new_ref }
             } else {
                 // Already cloned, return the cached one
+                let existing = self.ref_array[array_pos]
+                    .as_ref()
+                    .expect("a repeated reference is preceded by its first occurrence");
                 IndexRef {
-                    inner: Rc::clone(&self.ref_array[array_pos]),
+                    inner: Rc::clone(existing),
                 }
             }
         }
@@ -700,6 +698,45 @@ mod tests {
     }
 
     #[test]
+    fn test_parallel_deep_clones_of_shared_template() {
+        use std::thread;
+
+        // Two graphs; `a` is referenced twice, `b` lives in another graph.
+        let first = RefGraph::new();
+        let second = RefGraph::new();
+        let a = first.create(1usize);
+        let template = Arc::new((a.clone(), a, second.create(2usize)));
+
+        let handles: Vec<_> = (0..16)
+            .map(|t| {
+                let template = Arc::clone(&template);
+                thread::spawn(move || {
+                    let mut previous: Option<(GraphRef<usize>, GraphRef<usize>, GraphRef<usize>)> =
+                        None;
+                    for i in 0..500 {
+                        let c = deep_clone(template.as_ref());
+                        assert!(c.0.ptr_eq(&c.1), "shared reference split");
+                        assert!(!c.0.same_graph(&c.2), "graphs merged");
+                        assert!(!c.0.same_graph(&template.0), "clone shares the original");
+                        if let Some(p) = &previous {
+                            assert!(!c.0.same_graph(&p.0), "two deep clones share a graph");
+                        }
+                        c.0.set(t * 10_000 + i);
+                        assert_eq!(c.1.get(), t * 10_000 + i);
+                        assert_eq!(c.2.get(), 2);
+                        previous = Some(c);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(template.0.get(), 1);
+        assert_eq!(template.2.get(), 2);
+    }
+
+    #[test]
     fn test_concurrent_deep_clone() {
         use std::thread;
 
@@ -768,7 +805,7 @@ mod tests {
                     for _ in 0..1000 {
                         let val = reader_ref.get();
                         // Values should be valid i64 (no torn reads)
-                        assert!(val >= 0 && val < 1000);
+                        assert!((0..1000).contains(&val));
                         let _ = last;
                         last = val;
                     }

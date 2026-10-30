@@ -20,3 +20,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [[bench]]
 name = "deep_clone_benchmark"
 harness = false
+
+[[bench]]
+name = "parallel_scaling"
+harness = false

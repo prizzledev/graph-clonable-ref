@@ -40,7 +40,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-graph-clonable-ref = "0.1"
+graph-clonable-ref = "0.2"
 ```
 
 ## Usage
