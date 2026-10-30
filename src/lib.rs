@@ -72,6 +72,8 @@ impl CloneMap {
 
 thread_local! {
     static CLONE_DEPTH: Cell<u32> = const { Cell::new(0) };
+    /// Counts ended passes, so a clone made across a pass end is not recorded.
+    static PASSES_ENDED: Cell<u64> = const { Cell::new(0) };
     static CLONE_MAP: RefCell<CloneMap> = RefCell::default();
 }
 
@@ -136,8 +138,13 @@ impl<T: Clone + Send + Sync + 'static> RefGraph<T> {
         let clone = match CLONE_MAP.with(|map| map.borrow_mut().get(key)) {
             Some(clone) => clone,
             None => {
+                let pass = PASSES_ENDED.with(Cell::get);
                 // No borrow held: cloning the data clones the `GraphRef`s inside it.
-                let clone: AnyGraph = self.deep_clone_graph();
+                let clone = self.deep_clone_graph();
+                if PASSES_ENDED.with(Cell::get) != pass {
+                    return clone; // the pass ended inside `T::clone`; record nothing
+                }
+                let clone: AnyGraph = clone;
                 CLONE_MAP.with(|map| {
                     map.borrow_mut()
                         .insert(key, Arc::clone(self) as AnyGraph, Arc::clone(&clone))
@@ -266,12 +273,22 @@ impl Drop for DeepCloneGuard {
             new
         });
         if depth == 0 {
+            PASSES_ENDED.with(|p| p.set(p.get() + 1));
             // Emptied outside the borrow: dropping a graph runs `Drop` of its values, which may
             // deep-clone. The empty map goes back to keep its capacity for the next pass.
-            let mut map = CLONE_MAP.with(RefCell::take);
+            // try_with: in a thread-local destructor the map may be gone already.
+            let Ok(mut map) = CLONE_MAP.try_with(RefCell::take) else {
+                return;
+            };
+            let used = map.graphs.len();
             map.graphs.clear();
+            // `clear` costs O(capacity): keep room for the next pass, but not the peak of one
+            // exceptionally large pass, which every later pass on this thread would pay for.
+            if map.graphs.capacity() > 4 * used.max(16) {
+                map.graphs.shrink_to(used);
+            }
             map.last = None;
-            CLONE_MAP.with(|m| *m.borrow_mut() = map);
+            let _ = CLONE_MAP.try_with(|m| *m.borrow_mut() = map);
         }
     }
 }

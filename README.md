@@ -19,16 +19,16 @@ This crate gives each deep clone a **thread-local clone map** keyed by graph, no
 
 - During `deep_clone()`, the thread records the clone of every graph it meets, keyed by the original graph's address
 - A reference into the same graph as the reference before it takes the clone from a last-used slot, without a hash lookup; a reference into another graph takes one hash lookup
-- Only the first reference into a graph touches the original graph: it reads the data once and clones it
-- No reference writes to memory that other threads share (no lock, no atomic on the original graph), so threads that deep-clone one shared template scale with the number of cores
-- The map is emptied when the outermost `deep_clone()` ends, also when a clone panics
+- Only the first reference into a graph touches the original graph: one read lock to clone its data and one reference count increment to keep it alive for the pass, so its address stays unique
+- Every further reference into that graph touches only thread-local memory and the new graph, so threads that deep-clone one shared template scale with the number of cores
+- The map is emptied when the outermost `deep_clone()` ends, also when a clone panics; it keeps its capacity for the next pass unless one pass was much larger than the current one
 
 Up to 0.2, each graph cached its clones behind a lock that every cloned reference took. Threads that deep-cloned one shared template slowed each other down: with one graph of 2048 values, 16 threads together managed 7% of the deep clones per second of one thread (`benches/parallel_scaling.rs`).
 
 ## Features
 
 - **Thread-safe** — `Send + Sync`, works with `Arc`, actix-web, tokio, rayon, etc.
-- **Scales across threads** — a cloned reference touches only thread-local memory and its new graph
+- **Scales across threads** — after the first reference into a graph, a cloned reference touches only thread-local memory and its new graph
 - **Panic-safe** — `DeepCloneGuard` with depth tracking ends the pass and empties the clone map on unwind
 - **Fast** — no hash lookup for consecutive references into one graph, one lookup otherwise
 - **Nestable** — `deep_clone` inside `deep_clone` works correctly
@@ -37,8 +37,10 @@ Up to 0.2, each graph cached its clones behind a lock that every cloned referenc
 
 ### Upgrading from 0.2
 
-- `GraphRef<T>: Clone` now requires `T: 'static`, for shallow clones too (both go through `Clone`); a `GraphRef<&'a str>` with a borrowed, non-`'static` lifetime can no longer be cloned
+- `GraphRef<T>: Clone` now requires `T: 'static`, for shallow clones too (both go through `Clone`); a `GraphRef<&'a str>` with a borrowed, non-`'static` lifetime can no longer be cloned, and generic code that clones a `GraphRef<T>` needs a `T: 'static` bound
 - `RefGraph::clear_cache()` does nothing; it is kept so existing calls still compile
+- Deep-cloning graph references inside a thread-local destructor can panic (and so abort) once the crate's own thread-local map has been destroyed; deep-cloning plain values there works
+- Single-threaded, templates made of many tiny graphs (one value each) deep-clone about 30% slower than in 0.2, because each graph costs a hash map insert; one graph with many values is faster
 
 ## Installation
 
