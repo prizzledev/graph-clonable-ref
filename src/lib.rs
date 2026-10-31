@@ -1,7 +1,13 @@
 //! A fast cloneable reference that preserves reference structure during deep cloning.
 //!
-//! Thread-safe (`Send + Sync`) and panic-safe. Uses `Arc`, `parking_lot::RwLock`,
-//! and generation-based tracking for O(1) reference resolution during cloning.
+//! Thread-safe (`Send + Sync`) and panic-safe. During [`deep_clone`] each thread records the
+//! clone of every graph it meets in a thread-local map, keyed by the original graph's address and
+//! emptied when the outermost pass ends (also on unwind). A reference into the same graph as the
+//! previous one skips the hash lookup. No reference writes to memory that other threads share, so
+//! threads that deep-clone one shared template do not slow each other down.
+//!
+//! Since 0.3.0 `GraphRef<T>: Clone` requires `T: 'static` (the map stores graphs as `dyn Any`),
+//! and [`RefGraph::clear_cache`] does nothing.
 //!
 //! # Example
 //! ```
@@ -26,24 +32,55 @@
 //! assert_eq!(data.0.get(), 100);   // Original unchanged
 //! ```
 
-use std::cell::Cell;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::any::Any;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+/// A `RefGraph<T>` with its type erased, so graphs of every `T` fit in one map.
+type AnyGraph = Arc<dyn Any + Send + Sync>;
+
+/// The clones made by the current deep-clone pass of this thread.
+#[derive(Default)]
+struct CloneMap {
+    /// The most recently used entry: references into one graph skip the hash lookup.
+    last: Option<(*const (), AnyGraph)>,
+    /// Original address -> (original, kept alive so no other graph gets its address; clone).
+    graphs: HashMap<*const (), (AnyGraph, AnyGraph)>,
+}
+
+impl CloneMap {
+    fn get(&mut self, key: *const ()) -> Option<AnyGraph> {
+        match &self.last {
+            Some((last, clone)) if *last == key => return Some(Arc::clone(clone)),
+            _ => {}
+        }
+        let clone = Arc::clone(&self.graphs.get(&key)?.1);
+        self.last = Some((key, Arc::clone(&clone)));
+        Some(clone)
+    }
+
+    /// Records `clone` unless the original has a clone already; returns the recorded one.
+    fn insert(&mut self, key: *const (), original: AnyGraph, clone: AnyGraph) -> AnyGraph {
+        let clone = Arc::clone(&self.graphs.entry(key).or_insert((original, clone)).1);
+        self.last = Some((key, Arc::clone(&clone)));
+        clone
+    }
+}
 
 thread_local! {
-    static CLONE_GENERATION: Cell<u64> = const { Cell::new(0) };
     static CLONE_DEPTH: Cell<u32> = const { Cell::new(0) };
+    /// Counts ended passes, so a clone made across a pass end is not recorded.
+    static PASSES_ENDED: Cell<u64> = const { Cell::new(0) };
+    static CLONE_MAP: RefCell<CloneMap> = RefCell::default();
 }
 
 /// Internal storage for a group of related references.
 /// All `GraphRef`s created from the same `RefGraph` share the underlying data.
 pub struct RefGraph<T: Send + Sync> {
     data: RwLock<Vec<T>>,
-    clone_cache: RwLock<Vec<(u64, Weak<RefGraph<T>>)>>,
 }
 
 impl<T: Send + Sync> RefGraph<T> {
@@ -51,7 +88,6 @@ impl<T: Send + Sync> RefGraph<T> {
     pub fn new() -> Arc<Self> {
         Arc::new(RefGraph {
             data: RwLock::new(Vec::new()),
-            clone_cache: RwLock::new(Vec::new()),
         })
     }
 
@@ -76,10 +112,9 @@ impl<T: Send + Sync> RefGraph<T> {
         self.data.read().is_empty()
     }
 
-    /// Clear the clone cache to free memory.
-    pub fn clear_cache(&self) {
-        self.clone_cache.write().clear();
-    }
+    /// Does nothing since 0.3.0 and is kept for compatibility: a graph caches no clones any
+    /// more; the clone map of a deep clone is thread-local and emptied when the pass ends.
+    pub fn clear_cache(&self) {}
 }
 
 impl<T: Clone + Send + Sync> RefGraph<T> {
@@ -88,46 +123,40 @@ impl<T: Clone + Send + Sync> RefGraph<T> {
         let data = self.data.read();
         Arc::new(RefGraph {
             data: RwLock::new(data.clone()),
-            clone_cache: RwLock::new(Vec::new()),
         })
     }
+}
 
-    /// Get or create a cached clone for the current generation.
-    /// Fast path is a single read-lock scan.
+impl<T: Clone + Send + Sync + 'static> RefGraph<T> {
+    /// This graph's clone in the current deep-clone pass of this thread, made on first use.
+    ///
+    /// Touches only thread-local memory and the clone, except on first use, which reads the
+    /// data and keeps `self` alive until the pass ends.
     #[inline]
-    fn get_or_create_clone(self: &Arc<Self>, current_gen: u64) -> Arc<RefGraph<T>> {
-        // Fast path: read lock (concurrent, uncontended ~2ns)
-        {
-            let cache = self.clone_cache.read();
-            for (generation, weak) in cache.iter() {
-                if *generation == current_gen {
-                    if let Some(arc) = weak.upgrade() {
-                        return arc;
-                    }
-                    break;
+    fn clone_in_pass(self: &Arc<Self>) -> Arc<Self> {
+        let key = Arc::as_ptr(self).cast::<()>();
+        let clone = match CLONE_MAP.with(|map| map.borrow_mut().get(key)) {
+            Some(clone) => clone,
+            None => {
+                let pass = PASSES_ENDED.with(Cell::get);
+                // No borrow held: cloning the data clones the `GraphRef`s inside it.
+                let clone = self.deep_clone_graph();
+                if PASSES_ENDED.with(Cell::get) != pass {
+                    return clone; // the pass ended inside `T::clone`; record nothing
                 }
+                let clone: AnyGraph = clone;
+                CLONE_MAP.with(|map| {
+                    map.borrow_mut()
+                        .insert(key, Arc::clone(self) as AnyGraph, Arc::clone(&clone))
+                })
+                // An unused `clone` drops here, outside the borrow, as its values may run code.
             }
-        }
-
-        // Slow path: clone graph, write lock, insert
-        let new_graph = self.deep_clone_graph();
-        {
-            let mut cache = self.clone_cache.write();
-            // Double-check: another thread may have inserted while we were cloning
-            for (generation, weak) in cache.iter() {
-                if *generation == current_gen {
-                    if let Some(arc) = weak.upgrade() {
-                        // Another thread beat us; drop our clone, use theirs
-                        return arc;
-                    }
-                    break;
-                }
-            }
-            // Cleanup dead entries
-            cache.retain(|(_, w)| w.strong_count() > 0);
-            cache.push((current_gen, Arc::downgrade(&new_graph)));
-        }
-        new_graph
+        };
+        // Invariant: the map keeps the original at `key` alive, so its entry was made by this
+        // function for this `T`.
+        clone
+            .downcast()
+            .expect("a clone has the type of its original graph")
     }
 }
 
@@ -178,24 +207,19 @@ impl<T: Send + Sync> GraphRef<T> {
     }
 }
 
-impl<T: Clone + Send + Sync> Clone for GraphRef<T> {
+/// `T: 'static` since 0.3.0: a deep clone stores graphs type-erased in a thread-local map.
+impl<T: Clone + Send + Sync + 'static> Clone for GraphRef<T> {
     #[inline]
     fn clone(&self) -> Self {
-        let current_gen = CLONE_GENERATION.with(|g| g.get());
-
-        if current_gen > 0 {
-            // We're in a deep clone operation - use generation-based lookup
-            let new_graph = self.graph.get_or_create_clone(current_gen);
-            GraphRef {
-                graph: new_graph,
-                index: self.index,
-            }
+        let graph = if CLONE_DEPTH.with(Cell::get) > 0 {
+            self.graph.clone_in_pass()
         } else {
             // Shallow clone - same graph, same index
-            GraphRef {
-                graph: Arc::clone(&self.graph),
-                index: self.index,
-            }
+            Arc::clone(&self.graph)
+        };
+        GraphRef {
+            graph,
+            index: self.index,
         }
     }
 }
@@ -236,7 +260,7 @@ pub fn deep_clone<T: Clone>(value: &T) -> T {
     value.clone()
 }
 
-/// Guard that ensures clone generation and depth are reset even on panic.
+/// Guard that ends the deep-clone pass (depth and clone map) even on panic.
 pub struct DeepCloneGuard {
     _private: (),
 }
@@ -249,31 +273,39 @@ impl Drop for DeepCloneGuard {
             new
         });
         if depth == 0 {
-            CLONE_GENERATION.with(|g| g.set(0));
+            PASSES_ENDED.with(|p| p.set(p.get() + 1));
+            // Emptied outside the borrow: dropping a graph runs `Drop` of its values, which may
+            // deep-clone. The empty map goes back to keep its capacity for the next pass.
+            // try_with: in a thread-local destructor the map may be gone already.
+            let Ok(mut map) = CLONE_MAP.try_with(RefCell::take) else {
+                return;
+            };
+            let used = map.graphs.len();
+            map.graphs.clear();
+            // `clear` costs O(capacity): keep room for the next pass, but not the peak of one
+            // exceptionally large pass, which every later pass on this thread would pay for.
+            if map.graphs.capacity() > 4 * used.max(16) {
+                map.graphs.shrink_to(used);
+            }
+            map.last = None;
+            let _ = CLONE_MAP.try_with(|m| *m.borrow_mut() = map);
         }
     }
 }
 
+/// Whether the calling thread is inside a deep-clone pass. Code that relies on shallow clones
+/// sharing their data (for example after building an instance from a template) can refuse to
+/// run inside one, since every `GraphRef` clone there copies its graph.
+pub fn in_deep_clone() -> bool {
+    CLONE_DEPTH.with(|depth| depth.get() > 0)
+}
+
 /// Begin a deep clone operation manually. Returns a guard that resets state on drop.
 ///
-/// Supports nesting: only the outermost call sets a new generation.
-/// Prefer `deep_clone()` for simple cases.
+/// Supports nesting: an inner call joins the pass of the outermost one, which ends when the
+/// outermost guard drops. Prefer `deep_clone()` for simple cases.
 pub fn begin_deep_clone() -> DeepCloneGuard {
-    let depth = CLONE_DEPTH.with(|d| {
-        let c = d.get();
-        d.set(c + 1);
-        c
-    });
-    if depth == 0 {
-        let generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
-        // Skip 0 (0 means shallow clone)
-        let generation = if generation == 0 {
-            NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
-        } else {
-            generation
-        };
-        CLONE_GENERATION.with(|g| g.set(generation));
-    }
+    CLONE_DEPTH.with(|d| d.set(d.get() + 1));
     DeepCloneGuard { _private: () }
 }
 
@@ -503,8 +535,8 @@ pub mod index_based {
     pub struct PerformIndexCloningNode<T> {
         /// Current position in pos_array
         counter: usize,
-        /// Pre-allocated array of new references
-        ref_array: Vec<Rc<RefCell<T>>>,
+        /// New references by position; `None` until the first reference to it is cloned.
+        ref_array: Vec<Option<Rc<RefCell<T>>>>,
         /// Cloned from PrepareNode
         pos_array: Vec<(bool, usize)>,
     }
@@ -512,14 +544,9 @@ pub mod index_based {
     impl<T: Clone> PerformIndexCloningNode<T> {
         /// Create from a prepare node. This clones the pos_array.
         pub fn from_prepare_node(node: &PrepareIndexCloningNode<T>) -> Self {
-            // Pre-allocate with dummy values (will be replaced)
-            let mut ref_array = Vec::with_capacity(node.ref_pos_counter);
-            ref_array.resize_with(node.ref_pos_counter, || {
-                Rc::new(RefCell::new(unsafe {
-                    // This is safe because we'll always set before reading
-                    std::mem::zeroed()
-                }))
-            });
+            // `None` instead of placeholder values: zeroed memory is not a valid `T` in general
+            // (`String`, references, `NonZero*`), and creating one is undefined behaviour.
+            let ref_array = vec![None; node.ref_pos_counter];
 
             Self {
                 counter: 0,
@@ -539,12 +566,15 @@ pub mod index_based {
             if !exists {
                 // First time seeing this reference in this clone
                 let new_ref = Rc::new(RefCell::new(orig.inner.borrow().clone()));
-                self.ref_array[array_pos] = Rc::clone(&new_ref);
+                self.ref_array[array_pos] = Some(Rc::clone(&new_ref));
                 IndexRef { inner: new_ref }
             } else {
                 // Already cloned, return the cached one
+                let existing = self.ref_array[array_pos]
+                    .as_ref()
+                    .expect("a repeated reference is preceded by its first occurrence");
                 IndexRef {
-                    inner: Rc::clone(&self.ref_array[array_pos]),
+                    inner: Rc::clone(existing),
                 }
             }
         }
@@ -700,6 +730,45 @@ mod tests {
     }
 
     #[test]
+    fn test_parallel_deep_clones_of_shared_template() {
+        use std::thread;
+
+        // Two graphs; `a` is referenced twice, `b` lives in another graph.
+        let first = RefGraph::new();
+        let second = RefGraph::new();
+        let a = first.create(1usize);
+        let template = Arc::new((a.clone(), a, second.create(2usize)));
+
+        let handles: Vec<_> = (0..16)
+            .map(|t| {
+                let template = Arc::clone(&template);
+                thread::spawn(move || {
+                    let mut previous: Option<(GraphRef<usize>, GraphRef<usize>, GraphRef<usize>)> =
+                        None;
+                    for i in 0..500 {
+                        let c = deep_clone(template.as_ref());
+                        assert!(c.0.ptr_eq(&c.1), "shared reference split");
+                        assert!(!c.0.same_graph(&c.2), "graphs merged");
+                        assert!(!c.0.same_graph(&template.0), "clone shares the original");
+                        if let Some(p) = &previous {
+                            assert!(!c.0.same_graph(&p.0), "two deep clones share a graph");
+                        }
+                        c.0.set(t * 10_000 + i);
+                        assert_eq!(c.1.get(), t * 10_000 + i);
+                        assert_eq!(c.2.get(), 2);
+                        previous = Some(c);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(template.0.get(), 1);
+        assert_eq!(template.2.get(), 2);
+    }
+
+    #[test]
     fn test_concurrent_deep_clone() {
         use std::thread;
 
@@ -768,7 +837,7 @@ mod tests {
                     for _ in 0..1000 {
                         let val = reader_ref.get();
                         // Values should be valid i64 (no torn reads)
-                        assert!(val >= 0 && val < 1000);
+                        assert!((0..1000).contains(&val));
                         let _ = last;
                         last = val;
                     }
@@ -843,7 +912,7 @@ mod tests {
         }));
         assert!(result.is_err());
 
-        // Generation should be reset — subsequent deep_clone should work
+        // The pass should be over — subsequent deep_clone should work
         let graph = RefGraph::new();
         let a = graph.create(42);
         let b = a.clone();
@@ -871,7 +940,7 @@ mod tests {
             // After inner panic, outer should still work at depth 0
             // (inner guard was dropped by unwinding, decrementing depth)
         }));
-        // outer_guard drops here, resetting generation
+        // outer_guard drops here, ending the pass
 
         // Should be back to clean state
         let b = a.clone();
@@ -895,7 +964,7 @@ mod tests {
         impl Clone for Container {
             fn clone(&self) -> Self {
                 // This should work with nesting — inner deep_clone
-                // reuses the outer generation
+                // joins the outer pass
                 Container {
                     inner: self.inner.clone(),
                 }
@@ -928,15 +997,15 @@ mod tests {
             let cloned_a = a.clone(); // deep clone
             {
                 let _inner = begin_deep_clone();
-                let cloned_b = b.clone(); // same generation as outer
+                let cloned_b = b.clone(); // same pass as outer
                 // Both should point to same new graph
                 assert!(cloned_a.same_graph(&cloned_b));
             }
-            // Inner guard dropped, but depth > 0, so generation stays
+            // Inner guard dropped, but depth > 0, so the pass goes on
             let cloned_b2 = b.clone();
             assert!(cloned_a.ptr_eq(&cloned_b2));
         }
-        // Outer guard dropped, depth == 0, generation reset
+        // Outer guard dropped, depth == 0, pass ended
 
         // Now a regular clone should be shallow
         let shallow = a.clone();
@@ -986,9 +1055,7 @@ mod tests {
 
         // Add some shared refs
         let mut all_refs = refs.clone();
-        for i in 0..5_000 {
-            all_refs.push(refs[i].clone());
-        }
+        all_refs.extend(refs[..5_000].iter().cloned());
 
         let cloned = deep_clone(&all_refs);
 
@@ -1000,12 +1067,158 @@ mod tests {
         }
 
         // Check values
-        for i in 0..10_000 {
-            assert_eq!(cloned[i].get(), i as i32);
+        for (i, r) in cloned[..10_000].iter().enumerate() {
+            assert_eq!(r.get(), i as i32);
         }
 
         // Independence
         cloned[0].set(-1);
         assert_eq!(all_refs[0].get(), 0);
+    }
+
+    // ========================================================================
+    // Thread-local clone map tests
+    // ========================================================================
+
+    /// Whether this thread's clone map holds nothing: no clone and no original kept alive.
+    fn clone_map_is_empty() -> bool {
+        CLONE_MAP.with(|m| {
+            let m = m.borrow();
+            m.graphs.is_empty() && m.last.is_none()
+        })
+    }
+
+    #[test]
+    fn test_thread_reuse_leaves_no_stale_state() {
+        // One thread runs pass after pass, as a pool thread does; each graph is dropped before
+        // the next one is made, so the next one may get its address.
+        std::thread::spawn(|| {
+            let mut previous: Option<GraphRef<i32>> = None;
+            for round in 0..3 {
+                let graph = RefGraph::new();
+                let a = graph.create(round);
+                let count = Arc::strong_count(&graph);
+                let (a2, b2) = deep_clone(&(a.clone(), a.clone()));
+                assert!(clone_map_is_empty());
+                assert_eq!(Arc::strong_count(&graph), count, "pass kept the original");
+                assert_eq!(Arc::strong_count(&a2.graph), 2, "pass kept the clone");
+                assert!(a2.ptr_eq(&b2));
+                assert_eq!(a2.get(), round, "clone of an earlier pass");
+                if let Some(p) = &previous {
+                    assert!(!a2.same_graph(p));
+                }
+                previous = Some(a2);
+            }
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn test_original_dropped_mid_pass_keeps_its_address() {
+        let _pass = begin_deep_clone();
+        let a = RefGraph::new().create(1);
+        let a2 = a.clone();
+        drop(a); // only the clone map holds the original graph now
+        // Graphs of the same size: the allocator would hand out the dropped one's address.
+        for i in 2..100 {
+            let b2 = RefGraph::new().create(i).clone();
+            assert!(
+                !b2.same_graph(&a2),
+                "new graph got the clone of a dropped one"
+            );
+            assert_eq!(b2.get(), i);
+        }
+    }
+
+    #[test]
+    fn test_panic_mid_pass_then_new_pass() {
+        use std::panic;
+
+        #[derive(Debug)]
+        struct PanicOnClone;
+        impl Clone for PanicOnClone {
+            fn clone(&self) -> Self {
+                panic!("clone panic!");
+            }
+        }
+
+        let graph = RefGraph::new();
+        let a = graph.create(7);
+        let p = RefGraph::new().create(PanicOnClone);
+        let count = Arc::strong_count(&graph);
+        // `a`'s graph is recorded, then cloning `p`'s graph panics.
+        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            deep_clone(&(a.clone(), p.clone()));
+        }));
+        assert!(result.is_err());
+        assert!(clone_map_is_empty());
+        assert_eq!(Arc::strong_count(&graph), count);
+
+        let (a2, b2) = deep_clone(&(a.clone(), a.clone()));
+        assert!(a2.ptr_eq(&b2));
+        assert!(!a2.same_graph(&a));
+        assert_eq!(a2.get(), 7);
+        assert_eq!(Arc::strong_count(&a2.graph), 2);
+    }
+
+    #[test]
+    fn test_many_graphs_in_one_pass() {
+        // Each reference is in another graph than the one before (types alternate, too), so
+        // every reference misses the last-used entry and takes the hash lookup.
+        let n = 1000;
+        let nums: Vec<_> = (0..n).map(|i| RefGraph::new().create(i)).collect();
+        let strs: Vec<_> = (0..n)
+            .map(|i| RefGraph::new().create(i.to_string()))
+            .collect();
+        let pairs = || nums.iter().cloned().zip(strs.iter().cloned());
+        let template: Vec<_> = pairs().chain(pairs().rev()).collect();
+
+        let cloned = deep_clone(&template);
+
+        assert!(clone_map_is_empty());
+        for i in 0..n {
+            let (num, s) = &cloned[i];
+            let (num_again, s_again) = &cloned[2 * n - 1 - i];
+            assert!(
+                num.ptr_eq(num_again) && s.ptr_eq(s_again),
+                "shared reference split"
+            );
+            assert!(!num.same_graph(&nums[i]) && !s.same_graph(&strs[i]));
+            assert_eq!((num.get(), s.get()), (i, i.to_string()));
+            assert_eq!(Arc::strong_count(&num.graph), 2, "pass kept the clone");
+            assert_eq!(
+                Arc::strong_count(&nums[i].graph),
+                3,
+                "pass kept the original"
+            );
+            if i > 0 {
+                assert!(!num.same_graph(&cloned[i - 1].0), "graphs merged");
+            }
+        }
+    }
+
+    #[test]
+    fn test_graph_of_graph_refs() {
+        // Cloning the outer graph's values clones references into the inner graph, so the
+        // clone map is used again while the outer graph is being cloned.
+        let inner = RefGraph::new().create(1);
+        let outer = RefGraph::new().create(inner.clone());
+
+        let (outer2, inner2) = deep_clone(&(outer.clone(), inner.clone()));
+
+        assert!(outer2.get().ptr_eq(&inner2));
+        assert!(!inner2.ptr_eq(&inner));
+        inner2.set(5);
+        assert_eq!(inner.get(), 1);
+    }
+
+    #[test]
+    fn in_deep_clone_reports_the_pass() {
+        assert!(!in_deep_clone());
+        let guard = begin_deep_clone();
+        assert!(in_deep_clone());
+        drop(guard);
+        assert!(!in_deep_clone());
     }
 }
