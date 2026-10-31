@@ -293,6 +293,13 @@ impl Drop for DeepCloneGuard {
     }
 }
 
+/// Whether the calling thread is inside a deep-clone pass. Code that relies on shallow clones
+/// sharing their data (for example after building an instance from a template) can refuse to
+/// run inside one, since every `GraphRef` clone there copies its graph.
+pub fn in_deep_clone() -> bool {
+    CLONE_DEPTH.with(|depth| depth.get() > 0)
+}
+
 /// Begin a deep clone operation manually. Returns a guard that resets state on drop.
 ///
 /// Supports nesting: an inner call joins the pass of the outermost one, which ends when the
@@ -1204,5 +1211,14 @@ mod tests {
         assert!(!inner2.ptr_eq(&inner));
         inner2.set(5);
         assert_eq!(inner.get(), 1);
+    }
+
+    #[test]
+    fn in_deep_clone_reports_the_pass() {
+        assert!(!in_deep_clone());
+        let guard = begin_deep_clone();
+        assert!(in_deep_clone());
+        drop(guard);
+        assert!(!in_deep_clone());
     }
 }
